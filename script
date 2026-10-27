@@ -23,6 +23,24 @@
 --             from all of its roll stages rather than raw weights, with the
 --             Saturday-only items removed (the module filters them out too).
 --
+--    Recycler Model named "Recycler" in Workspace.Map.Monuments - one per
+--             monument garage, three in this map version, plus anything moved
+--             elsewhere. Its Kind attribute is "recycler", it has no
+--             PrimaryPart, and its On attribute is true while it is running.
+--    Aim      NPCs only - guards in Workspace.Npcs, animals in Workspace.Animals
+--             and optionally the offline bodies in Workspace.Sleepers. It points
+--             the camera at the head - instantly with Instant snap, or by a share
+--             of the remaining angle per frame - applied on Heartbeat so the
+--             camera script cannot overwrite it, and locks one target at a time.
+--             Camera only: no mouse movement, so nothing can overshoot the head.
+--             Off until switched on; hold the key, or use Always on.
+--    Watch    Players who move like they have commands: a live character at
+--             full transparency (invisible), climbing or carrying a physics
+--             mover (flying), or a jump further than the slider (teleporting).
+--             Permissions are never replicated to a client - there is no admin
+--             folder, rank attribute or remote that says who is staff - so this
+--             flags the behaviour and labels it that way, never a rank.
+--
 --  KEEPING IT LEGIBLE
 --    Only the nearest few targets get a text label, only nearby crates get an
 --    item line, and every label is measured and collision tested so two labels
@@ -36,11 +54,32 @@ local lp         = Players.LocalPlayer
 -- Matcha's type() reports "userdata" for vectors; typeof() gives Vector3.
 local typeOf = (type(typeof) == "function") and typeof or type
 
--- running it twice should replace the old boxes, not stack another set on top
-local prev = rawget(_G, "FUST_ESP")
-if type(prev) == "table" and type(prev.unload) == "function" then
-    pcall(prev.unload)
+-- Forward declaration: the staff watcher notifies through it, and the library
+-- is loaded further down. A local declared at that point would not be in scope
+-- inside the watcher's closures.
+local Nexa
+
+-- One clock for the whole script; tick() exists in every executor seen here.
+local clock = tick or os.clock
+
+-- running it twice should replace the old boxes, not stack another set on top.
+-- Some executors give every execution a fresh _G, so getgenv() is checked too -
+-- that is where a re-run can actually find the previous instance.
+local function findPrev()
+    local list = { rawget(_G, "FUST_ESP") }
+    if type(getgenv) == "function" then
+        local env = getgenv()
+        if type(env) == "table" then list[#list + 1] = env.FUST_ESP end
+    end
+    for i = 1, #list do
+        local v = list[i]
+        if type(v) == "table" and type(v.unload) == "function" then return v end
+    end
+    return nil
 end
+
+local prev = findPrev()
+if prev then pcall(prev.unload) end
 
 --============================================================================
 --  CONFIG
@@ -70,6 +109,38 @@ local S = {
                                              -- never the crate's actual contents
         itemsOnNearest = 3,                  -- only this many crates get a second line
         color    = Color3.fromRGB(255, 190, 70),
+    },
+    recycler = {
+        on    = true,
+        color = Color3.fromRGB(255, 215, 0),      -- yellow, readable over the map
+    },
+    aim = {
+        on        = false,               -- off until asked: it turns the camera
+        always    = false,               -- true = aim with no key held
+        key       = "x",
+        guards    = true,
+        animals   = true,
+        sleepers  = false,
+        part      = "head",              -- head | chest
+        fov       = 35,                  -- degrees from screen centre
+        range     = 150,                 -- studs
+        speed     = 45,                  -- percent of the remaining angle per frame
+        snap      = true,                -- true = point straight at the head, no sweep
+        autoFire  = false,
+        visible   = true,                -- raycast before aiming
+        circle    = true,
+        color     = Color3.fromRGB(255, 255, 255),
+    },
+    watch = {
+        on           = true,
+        invisible    = true,
+        flying       = true,
+        teleport     = true,
+        onlyFlagged  = true,                 -- off = box every player in range
+        teleportJump = 140,                  -- studs in one sample that counts as a teleport
+        range        = 600,                  -- the watch reaches further than the ESP
+        notify       = true,
+        color        = Color3.fromRGB(255, 90, 90),
     },
     draw = {
         names   = true,
@@ -249,6 +320,703 @@ local function posOf(model)
 end
 
 --============================================================================
+--  RECYCLERS  -  static machines, so the tree is walked on a timer
+--
+--  A recycler is a Model named "Recycler" carrying Kind = "recycler", a
+--  Marker_Prompt child and no PrimaryPart. Three exist in this map version:
+--
+--      Workspace.Map.Monuments.GasStation.Recycler
+--      Workspace.Map.Monuments.PowerPlant.Garage.Recycler
+--      Workspace.Map.Monuments.ArcticBase.Garage.Recycler
+--
+--  The walk is scoped, not recursive over the whole map: one extra GetChildren
+--  per monument, looking for a child called Recycler and for a garage-like
+--  child that holds one. Running the deep walk on a 26-monument map every
+--  sweep would cost more than the rest of the ESP together.
+--============================================================================
+
+local recyclers     = {}                     -- { pos, label, on }
+local recyclerAt    = 0
+local RECYCLER_EVERY = 6                     -- seconds between tree walks
+
+local function recyclerPos(model)
+    for _, name in ipairs({ "Marker_Prompt", "Body", "Hopper", "Frame" }) do
+        local part = model:FindFirstChild(name)
+        if part then
+            local ok, v = pcall(function() return part.Position end)
+            if ok and typeOf(v) == "Vector3" then return v end
+        end
+    end
+    return posOf(model)
+end
+
+local function scanRecyclers()
+    local out, seen = {}, {}
+
+    local function take(model)
+        local full = model:GetFullName()
+        if seen[full] then return end
+        seen[full] = true
+
+        local kind = model:GetAttribute("Kind")
+        if kind ~= nil and kind ~= "recycler" then return end
+        if kind == nil and not model:FindFirstChild("Marker_Prompt") then return end
+
+        local pos = recyclerPos(model)
+        if not pos then return end
+
+        local place = model:GetAttribute("Monument")
+        if type(place) ~= "string" or place == "" then place = model:GetAttribute("RecyclerId") end
+        if type(place) ~= "string" or place == "" then
+            local parent = model.Parent
+            place = parent and parent.Name or "Recycler"
+        end
+
+        out[#out + 1] = { pos = pos, label = place, on = model:GetAttribute("On") == true }
+    end
+
+    -- the monuments' own recyclers
+    local mon = workspace:FindFirstChild("Map")
+    mon = mon and mon:FindFirstChild("Monuments")
+    if mon then
+        local list = mon:GetChildren()
+        for i = 1, #list do
+            local m = list[i]
+            local direct = m:FindFirstChild("Recycler")
+            if direct then take(direct) end
+
+            local kids = m:GetChildren()
+            for j = 1, #kids do
+                local sub = kids[j]:FindFirstChild("Recycler")
+                if sub then take(sub) end
+            end
+        end
+    end
+
+    -- and anything a player moved or spawned at the top of the workspace
+    local top = workspace:GetChildren()
+    for i = 1, #top do
+        if top[i].Name == "Recycler" then take(top[i]) end
+    end
+
+    recyclers = out
+    recyclerAt = clock()
+end
+
+task.spawn(function()
+    local ok, err = pcall(scanRecyclers)
+    if not ok then print("[FUST] recycler scan error: " .. tostring(err)) end
+    while running do
+        task.wait(1)
+        if clock() - recyclerAt >= RECYCLER_EVERY then
+            local ok2, err2 = pcall(scanRecyclers)
+            if not ok2 then print("[FUST] recycler scan error: " .. tostring(err2)) end
+        end
+    end
+end)
+
+--============================================================================
+--  STAFF WATCH  -  players behaving like they have commands
+--
+--  Permissions are not replicated. Checked live in this game: ReplicatedStorage
+--  holds only Folder.Fust, the Players service holds nothing but Player
+--  objects, no player or character attribute carries a rank, and CoreGui has no
+--  admin system installed. So nothing here can say "staff"; what it can do is
+--  catch the three things only a command user does, and say which one fired.
+--
+--    INVISIBLE  every body part of a live character is at 0.9 transparency or
+--               higher. Normal players sit at 0.00. The root part is skipped -
+--               it is invisible on everybody.
+--    FLY        the character climbs for 0.8s solid, or it carries a physics
+--               mover (BodyVelocity, BodyPosition, AlignPosition,
+--               LinearVelocity ...), which is what a fly script attaches.
+--    TELEPORT   the character jumps further than the slider allows in a single
+--               sample. A respawn cannot trip it: health jumps back up at the
+--               same moment, so the tracker resets instead of calling it a jump.
+--
+--  IT HAS TO STAY CHEAP. A first version walked GetDescendants on every
+--  character five times a second and that was enough to take the client down.
+--  Everything here is now budgeted: 2 character scans, 3 child lookups and one
+--  row of transparency reads per sample, with the root and humanoid cached for
+--  8s at a time, and the interval doubles itself whenever a sample runs long.
+--
+--  Matcha notes, all verified live by measurement: IsA() answers true for
+--  everything there, so classes are matched by ClassName; a property read like
+--  .Position costs ~0.002 ms while a name lookup costs ~0.5 ms, which is why
+--  lookups are cached and positions are not; Transparency and Position read
+--  fine, while WalkSpeed, FloorMaterial and Humanoid:GetState() do not exist.
+--============================================================================
+
+local BODY_PART = {
+    Head = true, Torso = true, UpperTorso = true, LowerTorso = true,
+    ["Left Arm"] = true, ["Right Arm"] = true, ["Left Leg"] = true, ["Right Leg"] = true,
+    LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+    RightUpperArm = true, RightLowerArm = true, RightHand = true,
+    LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+    RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+}
+
+local MOVER = {
+    BodyVelocity = true, BodyPosition = true, BodyGyro = true,
+    BodyAngularVelocity = true, BodyForce = true,
+    AlignPosition = true, AlignOrientation = true,
+    LinearVelocity = true, AngularVelocity = true,
+}
+
+local WATCH_MAX    = 24                      -- characters read per sample, nearest first
+local WATCH_SAMPLE = 0.35                    -- seconds between samples
+local WATCH_SLOW   = 1.0                     -- interval it backs off to if a sample is costly
+local WATCH_BUDGET = 0.010                   -- a sample over 10 ms slows itself down
+local WATCH_REBUILD = 10                     -- rescan a character's parts this often
+local WATCH_REF     = 8                      -- refresh a cached root/humanoid this often
+
+local watchInterval = WATCH_SAMPLE
+local watchCost     = 0                      -- last sample, seconds
+
+-- Keyed by UserId, never by the Instance and never by Name: Matcha's wrappers do
+-- not compare or hash equal, so an Instance key silently multiplies one player
+-- into many states - the same rule its own reference spells out.
+local watch        = {}                      -- [userId] = state
+local watchLog     = {}                      -- newest first: { name, reason, at }
+local watchFlagged = 0
+local notifyAt     = {}                      -- [userId] = last notification time
+local myUid        = lp.UserId
+local scanBudget   = 0                       -- character scans left in this sample
+local refBudget    = 0                       -- cached root/humanoid lookups left
+
+-- Ordered shortest first so the reason reads the way it was noticed.
+local function watchReasons(st, t)
+    local out = {}
+    if st.flags.invisible and t - st.flags.invisible <= 5 then
+        out[#out + 1] = "INVISIBLE"
+    end
+    if (st.flags.fly and t - st.flags.fly <= 4)
+        or (st.flags.mover and t - st.flags.mover <= 4) then
+        out[#out + 1] = "FLY"
+    end
+    if st.flags.teleport and t - st.flags.teleport <= 6 then
+        out[#out + 1] = string.format("TELEPORT %dm", math.floor(st.jump or 0))
+    end
+    return table.concat(out, " + ")
+end
+
+local function watchNote(name, reason)
+    local t = clock()
+    table.insert(watchLog, 1, { name = name, reason = reason, at = t })
+    for i = #watchLog, 7, -1 do watchLog[i] = nil end
+
+    if S.watch.notify and Nexa and type(Nexa.Notify) == "function" then
+        local last = notifyAt[name] or 0
+        if t - last > 20 then
+            notifyAt[name] = t
+            pcall(function()
+                Nexa:Notify({
+                    Title   = "Possible staff: " .. name,
+                    Content = reason,
+                    Type    = "warning",
+                    Duration = 6,
+                })
+            end)
+        end
+    end
+end
+
+-- One walk of a character, done rarely: keep the body part instances and note
+-- whether anything physics-y is attached. Every later sample only re-reads the
+-- cached parts' Transparency.
+--
+-- GetChildren, not GetDescendants: body parts and physics movers are direct
+-- children, it is an order of magnitude cheaper, and it cannot return the same
+-- part twice the way GetDescendants does here. The first version walked
+-- descendants on every character five times a second and took the client down.
+local function buildScan(char)
+    local parts, mover = {}, false
+    local ok, list = pcall(function() return char:GetChildren() end)
+    if not ok or type(list) ~= "table" then return parts, mover end
+
+    for i = 1, #list do
+        local d = list[i]
+        if MOVER[d.ClassName] then mover = true end
+        if BODY_PART[d.Name] and type(d.Transparency) == "number" then
+            parts[#parts + 1] = d
+        end
+    end
+    return parts, mover
+end
+
+-- Cheap per sample: at most ~18 property reads per character, one closure.
+-- GetDescendants only on a timer, and only while this sample still has budget:
+-- identity comparisons are useless here, so a timer is the only safe trigger.
+local function partStats(st, char, t)
+    local stale = (not st.parts) or (t - (st.scanAt or 0) >= WATCH_REBUILD)
+    if stale and scanBudget > 0 then
+        st.parts, st.mover = buildScan(char)
+        st.scanAt = t
+        scanBudget = scanBudget - 1
+    end
+    if not st.parts then return 0, 0, false end
+
+    local ok, hidden = pcall(function()
+        local h = 0
+        for i = 1, #st.parts do
+            local tr = st.parts[i].Transparency
+            if type(tr) == "number" and tr >= 0.9 then h = h + 1 end
+        end
+        return h
+    end)
+    if not ok then return 0, 0, false end
+    return #st.parts, hidden, st.mover
+end
+
+local function watchSample()
+    local started = clock()
+    local t = started
+    if not S.watch.on then
+        watchFlagged = 0
+        return
+    end
+
+    local seen = {}
+    local ok, players = pcall(function() return Players:GetPlayers() end)
+    if not ok or type(players) ~= "table" then return end
+
+    local myPos = rootCache and rootCache.Position
+    local reach = S.watch.range + 150          -- far characters are not worth reading
+
+    local scanned = 0                          -- hard cap, however many players there are
+    scanBudget = 2                             -- at most 2 character scans per sample
+    refBudget  = 3                             -- at most 3 child lookups per sample
+
+    for i = 1, #players do
+        local p   = players[i]
+        local uid = tonumber(p.UserId) or 0
+        if uid ~= myUid then
+            seen[uid] = true
+            local st = watch[uid]
+            if not st then
+                -- Name is read once: it never changes, and every property read
+                -- here is a call into the game, so per-sample name lookups were
+                -- pure waste.
+                st = { flags = {}, first = t, name = p.Name }
+                watch[uid] = st
+            end
+
+            -- FindFirstChild is the expensive call in this VM (measured ~0.5 ms
+            -- each: 48 characters = 26 ms a sweep), so the character, root and
+            -- humanoid are cached and refreshed on a budget. Reading .Position
+            -- and .Health off that cache is effectively free.
+            if (not st.hrp) or (t - (st.refAt or 0) >= WATCH_REF) then
+                if refBudget > 0 then
+                    refBudget = refBudget - 1
+                    st.char  = p.Character
+                    st.hrp   = st.char and st.char:FindFirstChild("HumanoidRootPart")
+                    st.hum   = st.char and st.char:FindFirstChildOfClass("Humanoid")
+                    st.refAt = t
+                    st.parts = nil               -- the body may be a new one
+                end
+            end
+
+            local char = st.char
+
+                local pos
+                if st.hrp then
+                    local okp, pv = pcall(function() return st.hrp.Position end)
+                    if okp and typeOf(pv) == "Vector3" then pos = pv end
+                end
+
+                local hp = 1
+                if st.hum then
+                    local okh, v = pcall(function() return st.hum.Health end)
+                    if okh and type(v) == "number" then hp = v end
+                end
+
+                local near = myPos == nil or pos == nil or (pos - myPos).Magnitude <= reach
+
+            if pos and near and scanned < WATCH_MAX then
+                scanned = scanned + 1
+                st.pos  = pos
+                st.seen = t
+
+                -- A big heal is a respawn, not a teleport. Without this, dying
+                -- and coming back reads as a 900 stud jump.
+                if st.lastHp and hp > st.lastHp + 5 then st.lastPos = nil end
+                st.lastHp = hp
+
+                -- Body state about once a second per character, not every sample:
+                -- invisibility and a physics mover are command states, they do
+                -- not flicker in 300 ms. Position is the only per-sample read.
+                if (t - (st.lastBody or 0)) >= 0.9 then
+                    st.lastBody = t
+                    local parts, hidden, mover = partStats(st, char, t)
+                    if S.watch.invisible and hp > 0 and parts >= 5 and hidden >= parts then
+                        st.flags.invisible = t
+                    end
+                    if mover then st.flags.mover = t end
+                end
+
+                if st.lastPos and st.lastT then
+                    local dt = t - st.lastT
+                    if dt > 0.05 and dt < 1.6 then
+                        local dx = pos.X - st.lastPos.X
+                        local dz = pos.Z - st.lastPos.Z
+                        local flat = math.sqrt(dx * dx + dz * dz)
+                        local vy   = (pos.Y - st.lastPos.Y) / dt
+
+                        if S.watch.teleport and flat >= S.watch.teleportJump then
+                            st.flags.teleport = t
+                            st.jump = flat
+                        end
+
+                        if S.watch.flying then
+                            if vy > 4 then
+                                st.climb = st.climb or t
+                                if t - st.climb >= 0.8 then st.flags.fly = t end
+                            elseif vy < -3 then
+                                st.climb = nil
+                            end
+                        end
+                    end
+                end
+
+                st.lastPos = pos
+                st.lastT   = t
+            else
+                -- streamed out, dead or out of range: a re-entering character
+                -- must not read as a teleport, so the tracker resets instead of
+                -- carrying the old position across the gap. The cached root is
+                -- kept so re-entering stays cheap.
+                st.pos     = nil
+                st.lastPos = nil
+                st.climb   = nil
+            end
+        end
+    end
+
+    -- collected first, removed after: mutating a table while iterating it is
+    -- how a sampler earns an "invalid key to next"
+    local gone = {}
+    for uid in pairs(watch) do
+        if not seen[uid] then gone[#gone + 1] = uid end
+    end
+    for i = 1, #gone do
+        watch[gone[i]] = nil
+        notifyAt[gone[i]] = nil
+    end
+
+    watchFlagged = 0
+    for uid, st in pairs(watch) do
+        local reason = watchReasons(st, t)
+        if reason ~= "" then
+            watchFlagged = watchFlagged + 1
+            if st.logged ~= reason then
+                st.logged = reason
+                watchNote(st.name or tostring(uid), reason)
+            end
+        else
+            st.logged = nil
+        end
+    end
+
+    watchCost = clock() - started
+end
+
+task.spawn(function()
+    while running do
+        local ok, err = pcall(watchSample)
+        if not ok then print("[FUST] watch error: " .. tostring(err)) end
+
+        -- self-throttle: on a busy server this drops to one sample a second
+        -- instead of spending the frame budget on 40 characters
+        if watchCost > WATCH_BUDGET then
+            watchInterval = math.min(WATCH_SLOW, watchInterval * 1.5)
+        else
+            watchInterval = math.max(WATCH_SAMPLE, watchInterval * 0.9)
+        end
+        task.wait(watchInterval)
+    end
+end)
+
+--============================================================================
+--  NPC AIM  -  turns the camera onto a guard, animal or sleeper
+--
+--  Why the camera and not the mouse: a mouse pixel is worth 10-30 screen pixels
+--  here, so a mouse-driven loop can only step in whole pixels and it lands past
+--  the head every time - that is the whip. The camera can be pointed at an exact
+--  direction instead, so the turn is measured in degrees and there is nothing to
+--  overshoot. cam.lookAt is the one camera write this executor honours, and it
+--  holds when applied on Heartbeat (writes during render are overwritten by the
+--  camera script).
+--
+--  The scan is every 5s and cached: body parts come from one GetChildren per
+--  model, never per frame. A frame only reads Head.Position and Health, and the
+--  raycast behind "visible only" runs at most five times a second.
+--============================================================================
+
+local aimTargets   = {}
+local aimScannedAt = 0
+local AIM_SCAN     = 5
+local AIM_DEAD     = 4                       -- pixels of error that count as on target
+
+local aimKeyHeld = false
+local aimKeyCode
+local lastLosAt, lastLosOk, lastLosFor = 0, true, nil
+
+local fovCircle = Drawing.new("Circle")
+fovCircle.Thickness = 1
+fovCircle.NumSides  = 48
+fovCircle.Filled    = false
+fovCircle.Visible   = false
+
+local rayParams
+do
+    local ok, p = pcall(function() return RaycastParams.new() end)
+    if ok and p then
+        pcall(function() p.FilterType = Enum.RaycastFilterType.Exclude end)
+        rayParams = p
+    end
+end
+
+local function partsOf(model)
+    local kids
+    local ok = pcall(function() kids = model:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return nil end
+
+    local head, torso, hum
+    for i = 1, #kids do
+        local k = kids[i]
+        if k.Name == "Head" then
+            local okp, v = pcall(function() return k.Position end)
+            if okp and typeOf(v) == "Vector3" then head = k end
+        elseif k.Name == "UpperTorso" or k.Name == "Torso" then
+            torso = k
+        elseif k.ClassName == "Humanoid" then
+            hum = k
+        end
+    end
+    return head, torso, hum
+end
+
+local function scanAim()
+    local out = {}
+
+    local function addFolder(folderName, kind, wanted)
+        if not wanted then return end
+        local folder = workspace:FindFirstChild(folderName)
+        if not folder then return end
+        local list
+        local ok = pcall(function() list = folder:GetChildren() end)
+        if not ok or type(list) ~= "table" then return end
+
+        for i = 1, #list do
+            local m = list[i]
+            local head, torso, hum = partsOf(m)
+            if head then
+                local hp = 1
+                if hum then
+                    local okh, v = pcall(function() return hum.Health end)
+                    if okh and type(v) == "number" then hp = v end
+                end
+                if hp > 0 then
+                    out[#out + 1] = { model = m, head = head, torso = torso, hum = hum, kind = kind, name = m.Name }
+                end
+            end
+        end
+    end
+
+    addFolder("Npcs", "guard", S.aim.guards)
+    addFolder("Animals", "animal", S.aim.animals)
+    addFolder("Sleepers", "sleeper", S.aim.sleepers)
+
+    aimTargets = out
+    aimScannedAt = clock()
+end
+
+local function keyDown()
+    if S.aim.always then return true end
+    if aimKeyHeld then return true end
+
+    if aimKeyCode == nil then
+        local name = tostring(S.aim.key or ""):upper()
+        if name ~= "" and name ~= "NONE" then
+            local ok, v = pcall(function() return Enum.KeyCode[name] end)
+            if ok and v then aimKeyCode = v end
+        end
+    end
+    if not aimKeyCode then return false end
+
+    local uis = game:GetService("UserInputService")
+    local ok, v = pcall(function() return uis:IsKeyDown(aimKeyCode.Value) end)
+    return ok and v == true
+end
+
+local function lineOfSight(target, point, origin)
+    if not rayParams then return true end
+    local ok, res = pcall(function()
+        rayParams.FilterDescendantsInstances = { lp.Character, target.model }
+        return workspace:Raycast(origin, point - origin, rayParams)
+    end)
+    if not ok then return true end
+    if res == nil then return true end
+    return (tonumber(res.Distance) or 0) >= (point - origin).Magnitude - 3
+end
+
+local aimLocked, aimError, aimMoves = nil, 0, 0
+
+-- Locking state. One direction to look at, produced by the frame loop and
+-- applied after the camera script has had its say.
+local aimStickyPos, aimStickyName = nil, nil
+local aimSteer, aimSettled = nil, 0
+
+local aimConn = RunService.RenderStepped:Connect(function()
+    if S.aim.circle and S.aim.on then
+        local vp  = vpCache
+        local cam = workspace.CurrentCamera
+        local fov = 70
+        if cam then
+            local okf, v = pcall(function() return cam.FieldOfView end)
+            if okf and type(v) == "number" then fov = v end
+        end
+        local radius = (S.aim.fov / math.max(fov, 1)) * (vp.Y * 0.5)
+        fovCircle.Position = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+        fovCircle.Radius   = math.max(6, radius)
+        fovCircle.Color    = S.aim.color
+        fovCircle.Visible  = true
+    elseif fovCircle.Visible then
+        fovCircle.Visible = false
+    end
+
+    if not S.aim.on then
+        aimLocked, aimStickyPos, aimSteer, aimSettled = nil, nil, nil, 0
+        return
+    end
+    if (clock() - aimScannedAt) >= AIM_SCAN then pcall(scanAim) end
+    if not keyDown() then
+        aimLocked, aimStickyPos, aimSteer, aimSettled = nil, nil, nil, 0
+        return
+    end
+
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    local camCF  = cam.CFrame
+    local origin = camCF.Position
+    local look   = camCF.LookVector
+
+    -- Pick the target nearest the crosshair, but keep the one already locked:
+    -- two guards standing together used to swap places every frame, and every
+    -- swap threw the camera at the other one.
+    local best, bestAngle, bestPos
+    local sticky, stickyPos
+    for i = 1, #aimTargets do
+        local t = aimTargets[i]
+        local part = (S.aim.part == "chest" and t.torso) or t.head
+        if part then
+            local okp, p = pcall(function() return part.Position end)
+            if okp and typeOf(p) == "Vector3" then
+                local d = (p - origin).Magnitude
+                if d > 1 and d <= S.aim.range then
+                    local dot = look:Dot((p - origin).Unit)
+                    if dot > 0 then
+                        local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
+                        if angle <= S.aim.fov then
+                            if not bestAngle or angle < bestAngle then
+                                best, bestAngle, bestPos = t, angle, p
+                            end
+                            if aimStickyPos and (p - aimStickyPos).Magnitude < 16 then
+                                sticky, stickyPos = t, p
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if sticky then best, bestPos = sticky, stickyPos end
+
+    if not best then
+        aimLocked, aimStickyPos, aimSteer, aimSettled = nil, nil, nil, 0
+        return
+    end
+
+    if S.aim.visible then
+        local now = clock()
+        if (now - lastLosAt) > 0.15 then
+            lastLosAt = now
+            lastLosOk = lineOfSight(best, bestPos, origin)
+        end
+        if not lastLosOk then
+            aimLocked, aimStickyPos, aimSteer = nil, nil, nil
+            return
+        end
+    end
+
+    local sp, onScreen = WorldToScreen(bestPos)
+    if not onScreen then
+        aimLocked, aimStickyPos, aimSteer = nil, nil, nil
+        return
+    end
+
+    local vp = vpCache
+    local ex = sp.X - vp.X * 0.5
+    local ey = sp.Y - vp.Y * 0.5
+    local err = math.sqrt(ex * ex + ey * ey)
+    aimError      = err
+    aimLocked     = best.name
+    aimStickyPos  = bestPos
+    aimStickyName = best.name
+
+    if err > AIM_DEAD then
+        -- the whole command is a direction: no pixels, no sensitivity, no step
+        -- that can land past the head
+        aimSteer   = (bestPos - origin).Unit
+        aimSettled = 0
+    else
+        aimSteer   = nil
+        aimSettled = aimSettled + 1
+        if S.aim.autoFire and aimSettled >= 2 and type(mouse1click) == "function" then
+            pcall(mouse1click)
+        end
+    end
+end)
+
+-- Applied on Heartbeat, after the camera script has run for the frame: the same
+-- write during render is overwritten, and a write from here is what the next
+-- frame renders. Turning a share of the remaining angle each frame also means
+-- the motion is a smooth sweep rather than a snap.
+local aimCamConn = RunService.Heartbeat:Connect(function()
+    if not aimSteer or not S.aim.on then return end
+
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    local origin = cam.CFrame.Position
+    local cur    = cam.CFrame.LookVector
+    local dir
+
+    if S.aim.snap then
+        -- straight onto the head, one frame, no travel to watch
+        dir = aimSteer
+    else
+        local heat = math.clamp((S.aim.speed or 45) / 100, 0.05, 1)
+
+        -- ease off as it closes in, so the last few degrees are not a twitch
+        if aimError < 60 then
+            heat = heat * math.clamp(aimError / 60, 0.35, 1)
+        end
+
+        dir = cur:Lerp(aimSteer, heat)
+        if dir.Magnitude < 0.001 then return end
+        dir = dir.Unit
+    end
+
+    local to = origin + dir
+    pcall(function() cam.lookAt(origin, to) end)                   -- this executor
+    pcall(function() cam.CFrame = CFrame.lookAt(origin, to) end)   -- ordinary executors
+    aimMoves = aimMoves + 1
+end)
+
+--============================================================================
 --  COLLECTOR  -  slow walk of the two folders, no drawing
 --============================================================================
 
@@ -339,6 +1107,60 @@ local function collect()
                                 end
                             end
                         end
+                    end
+                end
+            end
+        end
+    end
+
+    if S.recycler.on then
+        for i = 1, #recyclers do
+            local r = recyclers[i]
+            local d = myPos and (r.pos - myPos).Magnitude or 0
+            if d <= maxD then
+                out[#out + 1] = {
+                    pos   = r.pos,
+                    dist  = d,
+                    h     = 3,
+                    kind  = "recycler",
+                    label = "Recycler - " .. r.label,
+                    sub   = r.on and "running" or "",
+                    color = S.recycler.color,
+                }
+            end
+        end
+    end
+
+    -- Watched players ride the same pool as ore and crates, so they get the
+    -- same boxes and collision-tested labels. force = true keeps their reason
+    -- line drawn even when the crate item-line budget is used up.
+    if S.watch.on then
+        local now = clock()
+        local myRoot = rootCache and rootCache.Position
+        -- keys snapshotted first: the sampler runs on another thread and can
+        -- drop a player mid-iteration, which would abort the sweep
+        local keys = {}
+        for uid in pairs(watch) do keys[#keys + 1] = uid end
+        for k = 1, #keys do
+            local uid = keys[k]
+            local st  = watch[uid]
+            local p   = st and st.pos
+            if p then
+                local reason = watchReasons(st, now)
+                if reason ~= "" or not S.watch.onlyFlagged then
+                    local d = myRoot and (p - myRoot).Magnitude or 0
+                    if d <= S.watch.range then
+                        out[#out + 1] = {
+                            pos   = p,
+                            dist  = d,
+                            h     = 3,
+                            foot  = 3,          -- down to the feet, not to the waist
+                            kind  = "player",
+                            label = st.name or tostring(uid),
+                            sub   = reason,
+                            color = reason ~= "" and S.watch.color or Color3.fromRGB(200, 200, 200),
+                            force = reason ~= "",
+                        }
                     end
                 end
             end
@@ -450,7 +1272,7 @@ local conn = RunService.RenderStepped:Connect(function()
         if n >= MAX_TARGETS then break end
         local t = list[i]
         local top, v1 = WorldToScreen(t.pos + Vector3.new(0, t.h, 0))
-        local bot, v2 = WorldToScreen(t.pos - Vector3.new(0, t.h * 0.4, 0))
+        local bot, v2 = WorldToScreen(t.pos - Vector3.new(0, t.foot or (t.h * 0.4), 0))
         if v1 and v2 then
             n = n + 1
             local e = pool[n]
@@ -493,12 +1315,12 @@ local conn = RunService.RenderStepped:Connect(function()
             if not named then
                 e.name.Visible = false
                 e.sub.Visible  = false
-            elseif t.sub ~= "" and itemLines > 0 then
+            elseif t.sub ~= "" and (itemLines > 0 or t.force) then
                 local sw = textWidth(e.sub, t.sub, 12)
                 local sy = bot.Y + 2
                 if not rectHits(top.X - sw * 0.5, sy, sw, 15, used) then
                     used = rectTake(top.X - sw * 0.5, sy, sw, 15, used)
-                    itemLines = itemLines - 1
+                    if not t.force then itemLines = itemLines - 1 end
                     e.sub.Color    = t.color
                     e.sub.Position = Vector2.new(top.X, sy)
                     e.sub.Visible  = true
@@ -604,7 +1426,7 @@ local function loadNexa()
     return nil
 end
 
-local Nexa = loadNexa()
+Nexa = loadNexa()
 
 if Nexa then
     Nexa:CreateWindow({
@@ -734,6 +1556,21 @@ if Nexa then
         ConfigKey = "fust.loot.color",
         Callback = function(c) S.loot.color = c end,
     })
+    lootMain:AddDivider({ Title = "Machines" })
+    lootMain:AddToggle({
+        Title = "Recycler ESP",
+        Description = "Box every recycler - one per monument garage - and say which are running.",
+        Default = true,
+        ConfigKey = "fust.recycler.on",
+        Callback = function(v) S.recycler.on = v end,
+    })
+    lootMain:AddColorPicker({
+        Title = "Recycler color",
+        Default = Color3.fromRGB(255, 215, 0),
+        DefaultAlpha = 1,
+        ConfigKey = "fust.recycler.color",
+        Callback = function(c) S.recycler.color = c end,
+    })
 
     local lootNotes = lootTab:AddSection("Contents", "What a crate shows", { Column = "right" })
     lootNotes:AddLabel({
@@ -757,6 +1594,303 @@ if Nexa then
             Description = t and string.format("%d-%d rolls, %d possible items", t.rolls[1], t.rolls[2], #t.items) or "no table",
         })
     end
+
+    local recStatus = lootNotes:AddStatus({ Title = "Recyclers", Default = "scanning", Tone = "accent" })
+    task.spawn(function()
+        while running do
+            local up = 0
+            for i = 1, #recyclers do
+                if recyclers[i].on then up = up + 1 end
+            end
+            pcall(function()
+                recStatus:SetValue(string.format("%d found, %d running", #recyclers, up), "accent")
+            end)
+            task.wait(2)
+        end
+    end)
+
+    ------------------------------------------------------------------ Watch
+    local watchTab = Nexa:AddTab({ Title = "Watch", Icon = "shield" })
+
+    local wMain = watchTab:AddSection("Staff watch", "Invisible, flying, teleporting", { Column = "left" })
+    wMain:AddToggle({
+        Title = "Watch players",
+        Description = "Sample every player about 3x a second and box the ones acting like staff.",
+        Default = true,
+        ConfigKey = "fust.watch.on",
+        Callback = function(v) S.watch.on = v end,
+    })
+    wMain:AddToggle({
+        Title = "Invisible",
+        Description = "Every body part of a live character faded to 0.9 or more. Normal players sit at 0.",
+        Default = true,
+        ConfigKey = "fust.watch.invisible",
+        Callback = function(v) S.watch.invisible = v end,
+    })
+    wMain:AddToggle({
+        Title = "Flying",
+        Description = "Climbing for 0.8s straight, or a physics mover attached to the character.",
+        Default = true,
+        ConfigKey = "fust.watch.flying",
+        Callback = function(v) S.watch.flying = v end,
+    })
+    wMain:AddToggle({
+        Title = "Teleporting",
+        Description = "Moved further than the slider allows between two samples.",
+        Default = true,
+        ConfigKey = "fust.watch.teleport",
+        Callback = function(v) S.watch.teleport = v end,
+    })
+    wMain:AddToggle({
+        Title = "Only flagged",
+        Description = "Off shows a box on every player in range, cleaned or not.",
+        Default = true,
+        ConfigKey = "fust.watch.onlyflagged",
+        Callback = function(v) S.watch.onlyFlagged = v end,
+    })
+    wMain:AddSlider({
+        Title = "Teleport distance",
+        Description = "Studs in one sample before it counts. High jump from a rocket is not a teleport.",
+        Min = 50, Max = 500, Step = 10, Default = 140, Suffix = "m",
+        ConfigKey = "fust.watch.jump",
+        Callback = function(v) S.watch.teleportJump = v end,
+    })
+    wMain:AddSlider({
+        Title = "Watch range",
+        Description = "Flagged players are drawn out to this distance, past the ore and crate range.",
+        Min = 100, Max = 2000, Step = 50, Default = 600, Suffix = "m",
+        ConfigKey = "fust.watch.range",
+        Callback = function(v) S.watch.range = v end,
+    })
+    wMain:AddColorPicker({
+        Title = "Alert color",
+        Default = Color3.fromRGB(255, 90, 90),
+        ConfigKey = "fust.watch.color",
+        Callback = function(c) S.watch.color = c end,
+    })
+
+    local wLog = watchTab:AddSection("Detections", "Newest first", { Column = "right" })
+    wLog:AddToggle({
+        Title = "Notify",
+        Description = "One toast per player per 20s, so a busy server does not spam you.",
+        Default = true,
+        ConfigKey = "fust.watch.notify",
+        Callback = function(v) S.watch.notify = v end,
+    })
+    local wStatus = wLog:AddStatus({ Title = "Flagged now", Default = "0", Tone = "danger" })
+    local wRows = {}
+    for i = 1, 6 do
+        wRows[i] = wLog:AddLabel({
+            Title = (i == 1 and "Latest" or " "),
+            Description = "-",
+        })
+    end
+
+    wLog:AddDivider({ Title = "What this can and cannot see" })
+    wLog:AddLabel({
+        Title = "No rank, only behaviour",
+        Description = "The server never tells a client who has perms - no admins folder, no rank attribute, no remote. So a flag means \"did something only a command user does\", not \"is on the staff list\".",
+    })
+    wLog:AddLabel({
+        Title = "Flying",
+        Description = "A rocket or a boat climbing under a player's control can read as FLY. The mover check is the giveaway: nothing in this game attaches BodyVelocity to a player.",
+    })
+    wLog:AddLabel({
+        Title = "Teleport",
+        Description = "Respawns are ignored - health jumping back to full resets the tracker instead of reading as a jump. Set the slider above a rocket's arc to keep those out too.",
+    })
+
+    -- refresh the panel once a second; the sampler itself never touches the GUI
+    task.spawn(function()
+        while running do
+            local now = clock()
+            pcall(function()
+                wStatus:SetValue(string.format("%d flagged / %d in server", watchFlagged, #Players:GetPlayers()), "danger")
+            end)
+
+            for i = 1, #wRows do
+                local e = watchLog[i]
+                pcall(function()
+                    if e then
+                        wRows[i]:SetTitle(e.name)
+                        wRows[i]:SetDescription(string.format("%s  -  %ds ago", e.reason, math.floor(now - e.at)))
+                    else
+                        wRows[i]:SetTitle(i == 1 and "Latest" or " ")
+                        wRows[i]:SetDescription("-")
+                    end
+                end)
+            end
+            task.wait(1)
+        end
+    end)
+
+    ------------------------------------------------------------------ Aim
+    local aimTab = Nexa:AddTab({ Title = "Aim", Icon = "crosshair" })
+
+    local aimMain = aimTab:AddSection("NPC aim", "Guards, animals, sleepers", { Column = "left" })
+    aimMain:AddToggle({
+        Title = "Aim assist",
+        Description = "Turns the camera onto the target while the key is held. Smooth sweep, no snaps.",
+        Default = false,
+        ConfigKey = "fust.aim.on",
+        Callback = function(v)
+            S.aim.on = v
+            if v then
+                aimStickyPos, aimSteer, aimSettled, aimMoves = nil, nil, 0, 0
+            end
+        end,
+    })
+    aimMain:AddKeybind({
+        Title = "Aim key",
+        Description = "Hold this to aim. Camera only - the mouse stays yours.",
+        Default = "x",
+        Mode = "Hold",
+        ConfigKey = "fust.aim.key",
+        Callback = function(v)
+            S.aim.key = v
+            aimKeyCode = nil
+        end,
+        Pressed = function() aimKeyHeld = true end,
+        Released = function() aimKeyHeld = false end,
+    })
+    aimMain:AddToggle({
+        Title = "Always on",
+        Description = "Aim without holding the key. The camera turns the whole time.",
+        Default = false,
+        ConfigKey = "fust.aim.always",
+        Callback = function(v)
+            S.aim.always = v
+            if v then
+                aimStickyPos, aimSteer, aimSettled, aimMoves = nil, nil, 0, 0
+            end
+        end,
+    })
+    aimMain:AddDropdown({
+        Title = "Targets",
+        Options = { "Guards", "Animals", "Sleepers" },
+        Default = { "Guards", "Animals" },
+        Multi = true,
+        VisibleRows = 3,
+        ConfigKey = "fust.aim.targets",
+        Callback = function(v)
+            local pick = {}
+            for i = 1, #v do pick[string.lower(tostring(v[i]))] = true end
+            S.aim.guards   = pick.guards == true
+            S.aim.animals  = pick.animals == true
+            S.aim.sleepers = pick.sleepers == true
+            pcall(scanAim)
+        end,
+    })
+    aimMain:AddDropdown({
+        Title = "Aim point",
+        Options = { "Head", "Chest" },
+        Default = "Head",
+        ConfigKey = "fust.aim.part",
+        Callback = function(v) S.aim.part = string.lower(tostring(v)) end,
+    })
+    aimMain:AddSlider({
+        Title = "FOV",
+        Description = "Only aim at targets inside this cone from screen centre.",
+        Min = 5, Max = 120, Step = 5, Default = 35, Suffix = "deg",
+        ConfigKey = "fust.aim.fov",
+        Callback = function(v) S.aim.fov = v end,
+    })
+    aimMain:AddSlider({
+        Title = "Max distance",
+        Min = 25, Max = 400, Step = 5, Default = 150, Suffix = "m",
+        ConfigKey = "fust.aim.range",
+        Callback = function(v) S.aim.range = v end,
+    })
+    aimMain:AddToggle({
+        Title = "Instant snap",
+        Description = "Point straight at the head on the first frame. Turn this off to get the smooth sweep instead.",
+        Default = true,
+        ConfigKey = "fust.aim.snap",
+        Callback = function(v) S.aim.snap = v end,
+    })
+    aimMain:AddSlider({
+        Title = "Aim speed",
+        Description = "Only used when Instant snap is off: share of the remaining angle per frame. Lower is smoother.",
+        Min = 5, Max = 100, Step = 5, Default = 45, Suffix = "%",
+        ConfigKey = "fust.aim.speed",
+        Callback = function(v) S.aim.speed = v end,
+    })
+    aimMain:AddToggle({
+        Title = "Auto fire",
+        Description = "Click once the crosshair is within a few pixels of the target.",
+        Default = false,
+        ConfigKey = "fust.aim.autofire",
+        Callback = function(v) S.aim.autoFire = v end,
+    })
+    aimMain:AddToggle({
+        Title = "Visible only",
+        Description = "Raycast before aiming, so it will not pull through walls.",
+        Default = true,
+        ConfigKey = "fust.aim.visible",
+        Callback = function(v) S.aim.visible = v end,
+    })
+    aimMain:AddToggle({
+        Title = "FOV circle",
+        Default = true,
+        ConfigKey = "fust.aim.circle",
+        Callback = function(v) S.aim.circle = v end,
+    })
+    aimMain:AddColorPicker({
+        Title = "Circle color",
+        Default = Color3.fromRGB(255, 255, 255),
+        DefaultAlpha = 1,
+        ConfigKey = "fust.aim.color",
+        Callback = function(c) S.aim.color = c end,
+    })
+
+    local aimNotes = aimTab:AddSection("How it aims", "And why it turns the camera", { Column = "right" })
+    aimNotes:AddLabel({
+        Title = "Why not the mouse",
+        Description = "A mouse pixel is worth 10-30 screen pixels here, and the mouse can only move in whole pixels, so every correction landed past the head - that is what made the view whip. Aiming the camera instead works in exact degrees, so there is nothing to overshoot.",
+    })
+    aimNotes:AddLabel({
+        Title = "Snap or sweep",
+        Description = "Instant snap points the camera at the head on the first frame. Turn it off and the view turns Aim speed percent of the remaining angle each frame instead - smoother, still no overshoot.",
+    })
+    aimNotes:AddLabel({
+        Title = "What counts as an NPC",
+        Description = "Guards are the 14 models in Workspace.Npcs (Health 150, NpcKind=guard). Animals are deer, boar and bear in Workspace.Animals. Sleepers are the offline bodies in Workspace.Sleepers - off by default.",
+    })
+    aimNotes:AddDivider({ Title = "HONEST LIMITS" })
+    aimNotes:AddLabel({
+        Title = "No silent aim",
+        Description = "It turns your view, so it is only as good as the game's aim model. If a weapon fires along the camera, this lines that up; it never rewrites a shot after the fact.",
+    })
+    aimNotes:AddLabel({
+        Title = "Goodbye whip",
+        Description = "No mouse deltas and no fixed-step corrections, so there is no loop that can hunt past the target. The turn is a vector towards the head, shortened each frame.",
+    })
+    aimNotes:AddLabel({
+        Title = "One target at a time",
+        Description = "The target stays locked while it is alive, in range and in the FOV, so two guards standing together cannot ping-pong the camera between them.",
+    })
+    aimNotes:AddLabel({
+        Title = "Dead zone",
+        Description = "Inside 4 px of the head it stops moving entirely instead of buzzing around it.",
+    })
+    aimNotes:AddLabel({
+        Title = "Release and it is yours",
+        Description = "Moving the mouse still turns the view while you hold the key - the assist turns it back. Release the key and the camera is yours again immediately.",
+    })
+    local aimStatus = aimNotes:AddStatus({ Title = "Targets cached", Default = "scanning", Tone = "accent" })
+    task.spawn(function()
+        while running do
+            local count = #aimTargets
+            local locked = ""
+            if aimLocked then
+                locked = string.format(", on %s (%dpx)", aimLocked, math.floor(aimError or 0))
+            end
+            pcall(function()
+                aimStatus:SetValue(string.format("%d found%s", count, locked), "accent")
+            end)
+            task.wait(2)
+        end
+    end)
 
     ------------------------------------------------------------------ Visuals
     local visTab = Nexa:AddTab({ Title = "Visuals", Icon = "eye" })
@@ -956,10 +2090,25 @@ local api
 api = {
     state   = S,
     targets = function() return targets end,
+    watch   = function() return watch, watchLog end,
+    recyclers = function() return recyclers end,
+    aim     = function()
+        return aimTargets, { locked = aimLocked, error = aimError, moves = aimMoves, key = S.aim.key }
+    end,
     stats   = function()
         local ore, crate = countKinds()
         print(string.format("[FUST] targets=%d (ore %d, crates %d) boxes=%d labels=%d pool=%d ui=%s loot=%s",
             #targets, ore, crate, lastDrawn, lastLabels, MAX_TARGETS, tostring(Nexa ~= nil), lootSource))
+        print(string.format("[FUST] watching %d player(s), %d flagged, %d log entr(ies), sample %.2f ms every %.2fs",
+            #Players:GetPlayers(), watchFlagged, #watchLog, watchCost * 1000, watchInterval))
+        for uid, st in pairs(watch) do
+            local reason = watchReasons(st, clock())
+            if reason ~= "" then
+                local p = st.pos
+                local d = (p and rootCache) and math.floor((p - rootCache.Position).Magnitude) or -1
+                print(string.format("   %-20s %-28s %dm", st.name or tostring(uid), reason, d))
+            end
+        end
     end,
     rescan = function()
         targets = collect()
@@ -969,6 +2118,9 @@ api = {
     unload = function()
         running = false
         if conn then conn:Disconnect() conn = nil end
+        if aimConn then aimConn:Disconnect() aimConn = nil end
+        if aimCamConn then aimCamConn:Disconnect() aimCamConn = nil end
+        pcall(function() fovCircle:Remove() end)
         for i = 1, #pool do
             local e = pool[i]
             pcall(function() e.box:Remove() end)
@@ -980,10 +2132,21 @@ api = {
         targets = {}
         if Nexa then pcall(function() Nexa:Hide() end) end
         if rawget(_G, "FUST_ESP") == api then rawset(_G, "FUST_ESP", nil) end
+        if type(getgenv) == "function" then
+            local env = getgenv()
+            if type(env) == "table" and env.FUST_ESP == api then env.FUST_ESP = nil end
+        end
         print("[FUST] unloaded")
     end,
 }
 
+api.FUST_ESP = api          -- marker: getgc("FUST_ESP") finds it even without _G
+
 _G.FUST_ESP = api
+-- published both ways: executors with a fresh _G per chunk still find it here
+if type(getgenv) == "function" then
+    local env = getgenv()
+    if type(env) == "table" then env.FUST_ESP = api end
+end
 
 print(string.format("[FUST] ready - %d loot tables from %s - _G.FUST_ESP.unload() to stop", tableCount, lootSource))
